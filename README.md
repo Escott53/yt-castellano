@@ -1,6 +1,6 @@
 # YT Castellano (PWA)
 
-Doblaje aproximado en español de vídeos de YouTube: pegas el enlace, la app lee los **subtítulos públicos** del vídeo (preferencia español), los sintetiza con **Web Speech API** (`es-ES`) y atenúa o silencia el audio original.
+Doblaje aproximado en español de vídeos de YouTube: pegas el enlace y **oyes una voz TTS en español** del contenido hablado. Los subtítulos/transcripción son solo la fuente interna (traducción → voz); el texto en pantalla es opcional y viene **desactivado**. Por defecto el audio original va **silenciado**.
 
 **Uso educativo / personal.** No descarga ni redistribuye el media de YouTube; depende de las pistas de subtítulos públicas y del reproductor iframe oficial. No redistribuir contenidos de terceros.
 
