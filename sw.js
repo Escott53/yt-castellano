@@ -1,5 +1,5 @@
 /* Service worker — cache-first de la app estática. */
-const CACHE_VERSION = 'yt-castellano-v1';
+const CACHE_VERSION = 'yt-castellano-v2';
 const ASSETS = [
   './', './index.html', './styles.css', './app.js', './manifest.json',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png'

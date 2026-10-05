@@ -49,13 +49,13 @@
   ];
 
   const DEFAULT_SETTINGS = {
-    originalVolume: 20,      // 0–100 YouTube volume while Spanish speaks
-    idleVolume: 55,          // volume when not speaking
-    muteOriginal: false,
+    originalVolume: 8,       // residual original while Spanish speaks (if not muted)
+    idleVolume: 25,          // original between Spanish phrases (if not muted)
+    muteOriginal: true,      // product default: hear Spanish voice, not English audio
     voiceRate: 1.05,
     voicePitch: 1,
-    showCaptions: true,
-    lookahead: 0.35,         // seconds before caption start to trigger TTS
+    showCaptions: false,     // on-screen Spanish text is optional; TTS is the product
+    lookahead: 0.35,         // seconds before segment start to trigger TTS
     ducking: true,
     preferSpanishTrack: true,
     captionProxy: '',        // optional Cloudflare Worker URL
@@ -401,7 +401,7 @@
       if (found >= 0) idx = found;
     }
     if (idx < 0 || !state.segments[idx]) {
-      el.innerHTML = '<span style="color:var(--muted);font-weight:600">Esperando voz en español…</span>';
+      el.innerHTML = '<span style="color:var(--muted);font-weight:600">Reproduciendo voz en español…</span>';
       return;
     }
     const s = state.segments[idx];
@@ -437,7 +437,7 @@
       events: {
         onReady: (e) => {
           applyDucking(false);
-          state.status = { kind: 'ok', msg: `${state.segments.length} frases listas · voz ES` };
+          state.status = { kind: 'ok', msg: `Voz española activa · ${state.segments.length} frases` };
           renderStatusOnly();
           syncLoop();
           try { e.target.playVideo(); } catch { /* autoplay may block */ }
@@ -495,7 +495,7 @@
 
       <section class="hero-card">
         <h2>Pega un enlace de YouTube</h2>
-        <p>Usamos los subtítulos del vídeo (preferimos español), los leemos en voz alta y atenuamos el audio original.</p>
+        <p>Escucha el vídeo en <b>voz española</b>: traducimos el habla (vía subtítulos internos) y la narramos con TTS. El audio original va silenciado o atenuado.</p>
         <div class="url-row">
           <input id="url-input" type="url" inputmode="url" autocomplete="off" spellcheck="false"
             placeholder="https://youtube.com/watch?v=…">
@@ -505,7 +505,7 @@
 
       <section class="card">
         <h3>Cómo funciona</h3>
-        <p class="hint">1) Subtítulos del vídeo → 2) traducción a español si hace falta → 3) voz TTS sincronizada (retraso típico 1–3 s). Sin subtítulos no hay doblaje automático; puedes pegar una transcripción.</p>
+        <p class="hint">1) Obtenemos la transcripción del vídeo (solo como fuente) → 2) la pasamos a español → 3) <b>voz TTS en español</b> sincronizada con el vídeo (retraso típico 1–3 s). El texto en pantalla es opcional y viene desactivado. Sin transcripción no hay doblaje; puedes pegar una manualmente.</p>
       </section>
 
       <section class="card">
@@ -535,7 +535,7 @@
       </div>
 
       <div class="caption-box ${state.settings.showCaptions ? '' : 'hidden'}" id="caption-box">
-        <span style="color:var(--muted);font-weight:600">Cargando subtítulos…</span>
+        <span style="color:var(--muted);font-weight:600">Preparando voz en español…</span>
       </div>
 
       <div class="card controls">
@@ -555,8 +555,8 @@
           <input type="range" id="rng-rate" min="0.7" max="1.4" step="0.05" value="${state.settings.voiceRate}">
           <output id="out-rate">${Number(state.settings.voiceRate).toFixed(2)}×</output>
         </div>
-        <div class="toggle" id="tog-mute"><span>Silenciar original</span><button type="button" class="switch ${state.settings.muteOriginal ? 'on' : ''}" data-key="muteOriginal" aria-pressed="${state.settings.muteOriginal}"></button></div>
-        <div class="toggle" id="tog-caps"><span>Mostrar texto en español</span><button type="button" class="switch ${state.settings.showCaptions ? 'on' : ''}" data-key="showCaptions" aria-pressed="${state.settings.showCaptions}"></button></div>
+        <div class="toggle" id="tog-mute"><span>Silenciar audio original (recomendado)</span><button type="button" class="switch ${state.settings.muteOriginal ? 'on' : ''}" data-key="muteOriginal" aria-pressed="${state.settings.muteOriginal}"></button></div>
+        <div class="toggle" id="tog-caps"><span>Mostrar texto (opcional)</span><button type="button" class="switch ${state.settings.showCaptions ? 'on' : ''}" data-key="showCaptions" aria-pressed="${state.settings.showCaptions}"></button></div>
       </div>
 
       <div class="play-bar">
@@ -795,7 +795,7 @@
     state.segments = [];
     state.lastSpokenIdx = -1;
     state.currentIdx = -1;
-    state.status = { kind: 'busy', msg: 'Buscando subtítulos…' };
+    state.status = { kind: 'busy', msg: 'Preparando doblaje en español…' };
     state.view = 'player';
     render();
 
@@ -812,15 +812,15 @@
         }
       } catch { /* */ }
       pushRecent(id, state.title);
-      state.status = { kind: 'ok', msg: `${segments.length} frases · origen ${langUsed}` };
+      state.status = { kind: 'ok', msg: `Voz ES lista · ${segments.length} frases` };
       renderStatusOnly();
       updateCaptionBox(0);
       if (state.ytReady) mountPlayer();
     } catch (err) {
       console.error(err);
-      state.status = { kind: 'err', msg: 'Sin subtítulos — pega una transcripción' };
+      state.status = { kind: 'err', msg: 'Sin transcripción — pégala para poder doblar' };
       renderStatusOnly();
-      toast('No se pudieron obtener subtítulos');
+      toast('No hay transcripción automática; pega una para doblar');
       openPasteSheet();
     }
   }

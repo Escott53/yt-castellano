@@ -15,47 +15,48 @@ fs.mkdirSync(out, { recursive: true });
   });
   const page = await ctx.newPage();
 
-  // Seed recent + settings for prettier home
   await page.goto('http://127.0.0.1:8765/', { waitUntil: 'domcontentloaded' });
   await page.evaluate(() => {
+    localStorage.clear();
     localStorage.setItem('ytcast-recent-v1', JSON.stringify([
       { id: 'iG9CE55wbtY', title: 'Do schools kill creativity? | Sir Ken Robinson | TED', at: Date.now() - 3600000 },
       { id: 'aircAruvnKk', title: 'But what is a neural network? | Deep learning', at: Date.now() - 86400000 },
     ]));
   });
   await page.reload({ waitUntil: 'networkidle' });
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(700);
   await page.screenshot({ path: `${out}/home.png`, fullPage: false });
-  console.log('home.png');
+  console.log('home');
 
-  // Settings sheet on home
   await page.click('#btn-settings');
-  await page.waitForTimeout(400);
+  await page.waitForTimeout(450);
   await page.screenshot({ path: `${out}/settings.png`, fullPage: false });
-  console.log('settings.png');
+  console.log('settings');
   await page.click('#set-close');
 
-  // Playing view with captions
   await page.goto('http://127.0.0.1:8765/?v=iG9CE55wbtY', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => window.__ytCast?.state?.segments?.length > 10, null, { timeout: 120000 });
-  await page.waitForTimeout(1500);
-  // Force caption box content
+  await page.waitForTimeout(1200);
   await page.evaluate(() => {
-    window.__ytCast.state.currentIdx = 1;
-    window.__ytCast.state.settings.showCaptions = true;
-    const s = window.__ytCast.state.segments[1];
-    const el = document.getElementById('caption-box');
-    if (el) el.textContent = s.textEs;
+    // Product view: captions OFF, mute ON
+    window.__ytCast.state.settings.showCaptions = false;
+    window.__ytCast.state.settings.muteOriginal = true;
+    const box = document.getElementById('caption-box');
+    if (box) box.classList.add('hidden');
+    document.querySelectorAll('.switch[data-key]').forEach((sw) => {
+      const key = sw.getAttribute('data-key');
+      const on = !!window.__ytCast.state.settings[key];
+      sw.classList.toggle('on', on);
+    });
     const pill = document.getElementById('status-pill');
     if (pill) {
       pill.className = 'status-pill ok';
-      pill.innerHTML = '<i class="dot"></i><span>275 frases · origen es</span>';
+      pill.innerHTML = '<i class="dot"></i><span>Voz española activa · 275 frases</span>';
     }
   });
   await page.waitForTimeout(400);
   await page.screenshot({ path: `${out}/playing.png`, fullPage: false });
-  console.log('playing.png');
-
+  console.log('playing');
   await b.close();
   console.log('SHOTS_OK');
 })().catch((e) => { console.error(e); process.exit(1); });
