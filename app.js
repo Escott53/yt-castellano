@@ -320,16 +320,34 @@
       applyDucking(true);
       state.currentIdx = idx;
       updateCaptionBox();
+      updateVoiceBanner();
     };
     u.onend = () => {
       state.speaking = false;
       applyDucking(false);
+      updateVoiceBanner();
     };
     u.onerror = () => {
       state.speaking = false;
       applyDucking(false);
+      updateVoiceBanner();
     };
     speechSynthesis.speak(u);
+  }
+
+
+  function updateVoiceBanner() {
+    const title = document.getElementById('voice-banner-title');
+    const sub = document.getElementById('voice-banner-sub');
+    if (!title || !sub) return;
+    title.textContent = state.speaking ? 'Hablando en español…' : 'Doblaje en español';
+    if (state.settings.muteOriginal) {
+      sub.textContent = 'Audio original silenciado · voz TTS es-ES';
+    } else if (state.settings.ducking) {
+      sub.textContent = `Original atenuado (${state.settings.originalVolume}%) mientras habla la voz`;
+    } else {
+      sub.textContent = 'Voz TTS + audio original a volumen normal';
+    }
   }
 
   function applyDucking(active) {
@@ -337,6 +355,7 @@
     if (state.settings.muteOriginal) {
       state.player.setVolume(0);
       state.player.mute?.();
+      updateVoiceBanner();
       return;
     }
     if (!state.settings.ducking) {
@@ -347,6 +366,7 @@
     state.player.unMute?.();
     const vol = active ? Number(state.settings.originalVolume) : Number(state.settings.idleVolume);
     state.player.setVolume(Math.max(0, Math.min(100, vol)));
+    updateVoiceBanner();
   }
 
   function syncLoop() {
@@ -532,6 +552,14 @@
 
       <div class="status-pill ${state.status.kind}" id="status-pill">
         <i class="dot"></i><span>${escapeHtml(state.status.msg)}</span>
+      </div>
+
+      <div class="voice-banner" id="voice-banner" aria-live="polite">
+        <span class="vb-icon">🎙️</span>
+        <div>
+          <b id="voice-banner-title">Doblaje en español</b>
+          <small id="voice-banner-sub">El audio original está silenciado; oyes la voz TTS</small>
+        </div>
       </div>
 
       <div class="caption-box ${state.settings.showCaptions ? '' : 'hidden'}" id="caption-box">

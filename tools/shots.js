@@ -38,7 +38,7 @@ fs.mkdirSync(out, { recursive: true });
   await page.waitForFunction(() => window.__ytCast?.state?.segments?.length > 10, null, { timeout: 120000 });
   await page.waitForTimeout(1200);
   await page.evaluate(() => {
-    // Product view: captions OFF, mute ON
+    // Product view: captions OFF, mute ON, voice banner on
     window.__ytCast.state.settings.showCaptions = false;
     window.__ytCast.state.settings.muteOriginal = true;
     const box = document.getElementById('caption-box');
@@ -53,6 +53,10 @@ fs.mkdirSync(out, { recursive: true });
       pill.className = 'status-pill ok';
       pill.innerHTML = '<i class="dot"></i><span>Voz española activa · 275 frases</span>';
     }
+    const title = document.getElementById('voice-banner-title');
+    const sub = document.getElementById('voice-banner-sub');
+    if (title) title.textContent = 'Hablando en español…';
+    if (sub) sub.textContent = 'Audio original silenciado · voz TTS es-ES';
   });
   await page.waitForTimeout(400);
   await page.screenshot({ path: `${out}/playing.png`, fullPage: false });
