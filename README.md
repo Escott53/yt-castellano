@@ -6,8 +6,12 @@ Doblaje aproximado en español de vídeos de YouTube: pegas el enlace y **oyes u
 
 ## Demo
 
-- GitHub Pages: https://escott53.github.io/yt-castellano/
+- **Repo:** https://github.com/Escott53/yt-castellano
+- **GitHub Pages (objetivo):** https://escott53.github.io/yt-castellano/
 - Ejemplo: `?v=iG9CE55wbtY` (TED — Sir Ken Robinson)
+- Local: `python3 -m http.server 8080` en esta carpeta
+
+> Nota: el sitio Pages queda en cola de GitHub Actions (`pages-build-deployment` / `Deploy Pages`) hasta que un runner lo publique; el código ya está en `main` y `gh-pages`.
 
 ## Qué funciona (oct 2026)
 
