@@ -2,7 +2,7 @@
 (() => {
   'use strict';
 
-  const APP_VERSION = '4';
+  const APP_VERSION = '5';
   const IS_ANDROID = /Android/i.test(navigator.userAgent);
   const CHARS_PER_SEC = 14;      // velocidad aproximada de TTS español a rate 1
   const MAX_UTTERANCE = 200;     // Android/Chrome fallan con frases muy largas
@@ -129,6 +129,8 @@
     ducking: true,
     preferSpanishTrack: true,
     captionProxy: '',
+    micLang: 'en-US',        // Modo micrófono: idioma que se escucha
+    micShowText: false,      // Modo micrófono: texto en pantalla (opcional, desactivado)
   };
 
   const state = {
@@ -829,6 +831,546 @@
     if (el.innerHTML !== html) el.innerHTML = html;
   }
 
+  // ---------- Modo micrófono: voz del vídeo (por el altavoz) → reconocimiento → traducción → voz ES ----------
+  // Pensado para Instagram/Facebook (sin subtítulos accesibles): el vídeo suena en voz alta y
+  // Chrome lo escucha con SpeechRecognition. Reutiliza translateBatch (clients5 → gtx → MyMemory)
+  // y las primitivas TTS de arriba (ttsSpeakNow/ttsUnlock/splitForSpeech, retraso tras cancel…).
+  // Bucle de realimentación: el móvil oiría su propia voz española, así que el reconocimiento se
+  // DETIENE mientras habla la voz y se reanuda cuando calla (y cualquier resultado que llegue
+  // mientras suena la voz se descarta).
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  const MIC_LANGS = [
+    ['en-US', 'Inglés (EE. UU.)'], ['en-GB', 'Inglés (Reino Unido)'], ['fr-FR', 'Francés'],
+    ['it-IT', 'Italiano'], ['pt-PT', 'Portugués'], ['de-DE', 'Alemán'],
+  ];
+  const micLangName = (code) => (MIC_LANGS.find((l) => l[0] === code) || MIC_LANGS[0])[1];
+  const micLangWord = (code) => ({ en: 'inglés', fr: 'francés', it: 'italiano', pt: 'portugués', de: 'alemán' }[String(code || 'en').slice(0, 2)] || 'inglés');
+  const MIC_FATAL = ['not-allowed', 'service-not-allowed', 'language-not-supported', 'unsupported'];
+  const mic = {
+    supported: !!SR,
+    active: false,          // el usuario pulsó «Empezar»
+    rec: null,              // SpeechRecognition en curso
+    starting: false,        // start() llamado, aún sin onstart
+    running: false,         // entre onstart y onend
+    hold: '',               // '' | 'stop' | 'abort': parado a propósito porque va a hablar / habla la voz
+    holdTimer: 0,
+    startTimer: 0,
+    nextStartAt: 0,         // cuándo se puede volver a arrancar (backoff)
+    backoff: 0,
+    endedAt: 0,
+    quietSince: 0,          // desde cuándo la voz TTS está callada
+    session: { at: 0, results: 0, error: '', forced: false },
+    token: 0,               // cambia al parar: descarta traducciones en vuelo
+    interim: '',
+    interimSince: 0,
+    lastFinal: '',
+    lastFinalAt: 0,
+    trChain: Promise.resolve(),
+    trPending: 0,
+    queue: [],              // frases en español pendientes de decir
+    item: null,             // { text, pieces, rate }
+    lines: [],              // [{ en, es, failed }]
+    error: '',              // último error relevante (código)
+    fatal: '',              // error que detiene el modo
+    ignored: 0,
+    dropped: 0,
+    tick: 0,
+    wakeLock: null,
+    stats: { starts: 0, ends: 0, results: 0, finals: 0, translated: 0, trFailed: 0, spoken: 0, restarts: 0, holds: 0 },
+  };
+
+  function ttsBusy() {
+    if (tts.current) return true;
+    try { return !!(tts.supported && (speechSynthesis.speaking || speechSynthesis.pending)); } catch { return false; }
+  }
+
+  function micStartTap() {
+    // ¡Síncrono dentro del gesto! (desbloquea la voz en Chrome Android, como «▶ Reproducir con voz»)
+    if (!mic.supported) { mic.fatal = 'unsupported'; micUpdateUI(); return; }
+    ttsUnlock('Escuchando');
+    mic.active = true;
+    mic.token += 1;
+    mic.fatal = ''; mic.error = ''; mic.backoff = 0; mic.nextStartAt = 0;
+    mic.queue = []; mic.item = null; mic.interim = '';
+    mic.quietSince = ttsBusy() ? 0 : performance.now() - 1000;
+    clearInterval(mic.tick);
+    mic.tick = setInterval(micTick, 200);
+    micWakeLock(true);
+    // Si no suena la frase de desbloqueo, arrancar ya (dentro del gesto: el aviso de permiso sale antes)
+    if (!ttsBusy()) micRecStart();
+    micUpdateUI();
+  }
+
+  function micStopTap() {
+    micStop();
+    micUpdateUI();
+  }
+
+  function micStop() {
+    mic.active = false;
+    mic.token += 1;
+    clearInterval(mic.tick); mic.tick = 0;
+    clearTimeout(mic.holdTimer); clearTimeout(mic.startTimer);
+    const rec = mic.rec;
+    micDetach();
+    if (rec) { try { rec.abort(); } catch { /* */ } }
+    if (mic.item || mic.queue.length) ttsStop();
+    mic.item = null; mic.queue = []; mic.interim = ''; mic.hold = '';
+    micWakeLock(false);
+  }
+
+  function micDetach() {
+    const rec = mic.rec;
+    if (rec) { rec.onstart = rec.onresult = rec.onerror = rec.onend = null; }
+    mic.rec = null; mic.running = false; mic.starting = false;
+  }
+
+  function micRecStart() {
+    if (!mic.active || !SR || mic.rec || mic.fatal) return;
+    let rec;
+    try { rec = new SR(); } catch { mic.fatal = 'unsupported'; micStop(); micUpdateUI(); return; }
+    rec.lang = state.settings.micLang || 'en-US';
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
+    const processed = new Set(); // índices finales ya tratados (Chrome Android repite resultados)
+    rec.onstart = () => {
+      if (mic.rec !== rec) return;
+      clearTimeout(mic.startTimer);
+      mic.starting = false; mic.running = true;
+      mic.stats.starts += 1;
+      if (mic.error !== 'network') mic.error = '';
+      micUpdateUI();
+    };
+    rec.onresult = (e) => { if (mic.rec === rec) micOnResult(e, processed); };
+    rec.onerror = (e) => { if (mic.rec === rec) micOnError(e?.error || 'error'); };
+    rec.onend = () => { if (mic.rec === rec) micOnEnd(); };
+    mic.rec = rec;
+    mic.starting = true;
+    mic.hold = '';
+    mic.session = { at: performance.now(), results: 0, error: '', forced: false };
+    mic.interim = ''; mic.interimSince = 0;
+    try {
+      rec.start();
+    } catch (err) {
+      console.warn('[mic] start() falló', err);
+      micDetach();
+      mic.session.error = 'start-throw';
+      micScheduleRestart();
+      return;
+    }
+    // si onstart no llega, abortar y reintentar
+    clearTimeout(mic.startTimer);
+    mic.startTimer = setTimeout(() => {
+      if (mic.rec === rec && mic.starting) {
+        try { rec.abort(); } catch { /* */ }
+        micDetach();
+        mic.session.error = 'no-start';
+        micScheduleRestart();
+        micUpdateUI();
+      }
+    }, 8000);
+  }
+
+  // Parar el reconocimiento porque va a hablar (stop: entrega lo ya oído) o ya suena una voz (abort)
+  function micHold(kind) {
+    if (!mic.rec) return;
+    if (mic.hold === 'abort' || mic.hold === kind) return;
+    mic.hold = kind;
+    mic.stats.holds += 1;
+    const rec = mic.rec;
+    try { if (kind === 'abort') rec.abort(); else rec.stop(); } catch { /* */ }
+    clearTimeout(mic.holdTimer);
+    mic.holdTimer = setTimeout(() => {
+      if (mic.rec !== rec) return;
+      try { rec.abort(); } catch { /* */ }
+      mic.holdTimer = setTimeout(() => { if (mic.rec === rec) micOnEnd(); }, 700); // onend nunca llegó
+    }, 900);
+  }
+
+  function micOnResult(e, processed) {
+    mic.stats.results += 1;
+    const finals = [];
+    let interim = '';
+    const results = e?.results || [];
+    for (let i = e?.resultIndex || 0; i < results.length; i++) {
+      const r = results[i];
+      const text = cleanText(r?.[0]?.transcript || '');
+      if (r?.isFinal) {
+        if (processed.has(i)) continue;
+        processed.add(i);
+        if (text) finals.push(text);
+      } else if (text) {
+        interim += (interim ? ' ' : '') + text;
+      }
+    }
+    // Realimentación: lo que llegue mientras suena la voz española (o justo después) es eco nuestro
+    if (ttsBusy() || mic.item || mic.hold === 'abort') {
+      mic.ignored += Math.max(1, finals.length);
+      mic.interim = '';
+      return;
+    }
+    mic.session.results += 1;
+    mic.backoff = 0;
+    if (mic.error === 'no-speech' || mic.error === 'network') mic.error = '';
+    if (finals.length) mic.interimSince = interim ? performance.now() : 0;
+    else if (interim && !mic.interim) mic.interimSince = performance.now();
+    else if (!interim) mic.interimSince = 0;
+    mic.interim = interim;
+    finals.forEach(micHandleFinal);
+    micUpdateUI();
+  }
+
+  function micHandleFinal(raw) {
+    const norm = (x) => x.toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, '').replace(/\s+/g, ' ').trim();
+    let text = raw;
+    const cur = norm(text);
+    if (cur.replace(/\s/g, '').length < 2) return;
+    const prev = norm(mic.lastFinal);
+    const recent = performance.now() - mic.lastFinalAt < 10000;
+    if (prev && recent) {
+      if (cur === prev) return; // duplicado (bug de Chrome Android)
+      if (cur.startsWith(`${prev} `)) {
+        // resultado acumulado: quedarse solo con lo nuevo
+        text = text.split(/\s+/).slice(prev.split(' ').length).join(' ');
+        if (norm(text).length < 2) return;
+      }
+    }
+    mic.lastFinal = raw;
+    mic.lastFinalAt = performance.now();
+    mic.stats.finals += 1;
+    const line = { en: text, es: '', failed: false };
+    mic.lines.push(line);
+    if (mic.lines.length > 30) mic.lines.shift();
+    const token = mic.token;
+    const src = state.settings.micLang || 'en-US';
+    mic.trPending += 1;
+    // traducir en paralelo, pero decirlo en orden
+    const job = translateBatch([text], src).catch(() => [null]);
+    mic.trChain = mic.trChain.then(() => job).then((out) => {
+      mic.trPending = Math.max(0, mic.trPending - 1);
+      if (token !== mic.token || !mic.active) return;
+      const es = out?.[0];
+      if (!es) { line.failed = true; mic.stats.trFailed += 1; micUpdateUI(); return; }
+      line.es = es;
+      mic.stats.translated += 1;
+      micEnqueue(es);
+      micUpdateUI();
+    }).catch((err) => console.warn('[mic] traducción', err));
+    micUpdateUI();
+  }
+
+  function micEnqueue(es) {
+    mic.queue.push(es);
+    // si vamos muy retrasados, descartar lo más viejo (mejor ir al día que leer frases de hace 20 s)
+    while (mic.queue.length > 3) { mic.queue.shift(); mic.dropped += 1; }
+    micPump();
+  }
+
+  function micPump() {
+    if (!mic.active || mic.item || !mic.queue.length) return;
+    if (!tts.supported || tts.broken) { mic.queue = []; micUpdateUI(); return; }
+    if (tts.lastError === 'not-allowed') { micUpdateUI(); return; } // esperar a un toque
+    if (tts.current) return;
+    if (mic.rec) { micHold('stop'); return; } // primero cerrar el micrófono; onend vuelve a llamar aquí
+    const now = performance.now();
+    if (now - (tts.lastCancelAt || 0) < 150 || now - mic.endedAt < 120) return; // el tick reintenta
+    let text = mic.queue.shift();
+    while (mic.queue.length && `${text} ${mic.queue[0]}`.length <= MAX_UTTERANCE) text += ` ${mic.queue.shift()}`;
+    const base = Number(state.settings.voiceRate) || 1;
+    const rate = clamp(mic.queue.length ? base * 1.15 : base, 0.5, 2);
+    mic.item = { text, pieces: splitForSpeech(text), rate };
+    micSpeakPiece();
+  }
+
+  function micSpeakPiece() {
+    const item = mic.item;
+    if (!item) return;
+    const piece = item.pieces.shift();
+    if (!piece || !mic.active) {
+      mic.item = null;
+      mic.quietSince = performance.now();
+      micUpdateUI();
+      setTimeout(micPump, 60);
+      return;
+    }
+    ttsSpeakNow(piece, {
+      rate: item.rate,
+      onstart: () => { mic.stats.spoken += 1; micUpdateUI(); },
+      onend: () => { if (mic.item === item) setTimeout(micSpeakPiece, 60); },
+      onerror: (code) => {
+        if (mic.item !== item) return;
+        if (code === 'not-allowed') {
+          // voz bloqueada por falta de gesto: guardar el texto para cuando el usuario toque
+          mic.queue.unshift([piece, ...item.pieces].join(' '));
+          mic.item = null;
+          mic.quietSince = performance.now();
+          micUpdateUI();
+          return;
+        }
+        setTimeout(micSpeakPiece, 60);
+      },
+    });
+    micUpdateUI();
+  }
+
+  function micOnError(code) {
+    mic.session.error = code;
+    if (code === 'aborted') return; // lo hemos parado nosotros
+    console.warn('[mic] error', code);
+    if (MIC_FATAL.includes(code)) {
+      mic.fatal = code;
+      micStop();
+      micUpdateUI();
+      return;
+    }
+    if (code === 'no-speech' || code === 'network' || code === 'audio-capture') mic.error = code;
+    micUpdateUI();
+  }
+
+  function micOnEnd() {
+    clearTimeout(mic.holdTimer); clearTimeout(mic.startTimer);
+    const held = mic.hold;
+    const s = mic.session;
+    micDetach();
+    mic.hold = '';
+    mic.endedAt = performance.now();
+    mic.stats.ends += 1;
+    mic.interim = '';
+    if (!mic.active || mic.fatal) { micUpdateUI(); return; }
+    if (held) {
+      // parado para hablar: se reanuda cuando la voz calle (micTick)
+      mic.nextStartAt = 0;
+      micPump();
+      micUpdateUI();
+      return;
+    }
+    micScheduleRestart(s);
+    micUpdateUI();
+  }
+
+  // Chrome (sobre todo Android) corta el reconocimiento tras unos segundos de silencio: relanzar con backoff
+  function micScheduleRestart(s = mic.session) {
+    if (!mic.active || mic.fatal) return;
+    const dur = performance.now() - (s.at || 0);
+    const err = s.error || '';
+    let delay;
+    if (s.results > 0 || s.forced) {
+      mic.backoff = 0; delay = 150;
+    } else if (err === 'network') {
+      mic.backoff = clamp((mic.backoff || 1000) * 2, 2000, 15000); delay = mic.backoff;
+    } else if (err === 'no-speech' || (!err && dur > 4000)) {
+      // silencio normal: relanzar rápido, con tope bajo para no perder la siguiente frase
+      mic.backoff = clamp((mic.backoff || 150) * 2, 300, 1500); delay = mic.backoff;
+    } else {
+      // terminó enseguida sin resultados (mic ocupado, foco de audio, error raro…)
+      mic.backoff = clamp((mic.backoff || 250) * 2, 500, 8000); delay = mic.backoff;
+    }
+    mic.nextStartAt = performance.now() + delay;
+    mic.stats.restarts += 1;
+  }
+
+  function micTick() {
+    if (!mic.active) return;
+    const now = performance.now();
+    const busy = ttsBusy();
+    if (busy) {
+      mic.quietSince = 0;
+      if (mic.rec && !mic.item) micHold('abort'); // otra voz (desbloqueo, Probar voz…) sonando con el micro abierto
+      else if (mic.rec && mic.item && tts.speaking) micHold('abort');
+    } else if (!mic.quietSince) {
+      mic.quietSince = now;
+    }
+    if (mic.queue.length && !mic.item) micPump();
+    // frase interminable sin resultado final (música, monólogo): forzar el cierre para traducir lo oído
+    if (mic.running && !mic.hold && mic.interim && mic.interimSince && now - mic.interimSince > 7000) {
+      mic.session.forced = true;
+      mic.interimSince = 0;
+      try { mic.rec.stop(); } catch { /* */ }
+    }
+    // (re)arrancar cuando todo está tranquilo
+    if (!mic.rec && !busy && !mic.item && !mic.queue.length && mic.quietSince && now - mic.quietSince >= 350
+      && now >= mic.nextStartAt && !mic.fatal) {
+      micRecStart();
+      micUpdateUI();
+    }
+  }
+
+  async function micWakeLock(on) {
+    try {
+      if (on) {
+        if (mic.wakeLock || document.hidden || !navigator.wakeLock?.request) return;
+        const lock = await navigator.wakeLock.request('screen');
+        if (!mic.active) { lock.release().catch(() => {}); return; }
+        mic.wakeLock = lock;
+        lock.addEventListener?.('release', () => { if (mic.wakeLock === lock) mic.wakeLock = null; });
+      } else if (mic.wakeLock) {
+        const lock = mic.wakeLock;
+        mic.wakeLock = null;
+        await lock.release();
+      }
+    } catch { /* sin wake lock: no pasa nada */ }
+  }
+
+  function micPhase() {
+    if (!mic.supported || mic.fatal === 'unsupported') return 'unsupported';
+    if (mic.fatal) return 'fatal';
+    if (!mic.active) return 'idle';
+    if (tts.supported && tts.broken) return 'tts-broken';
+    if (tts.lastError === 'not-allowed' && (mic.queue.length || mic.item)) return 'tts-blocked';
+    if (mic.item || (ttsBusy() && !mic.rec)) return 'speaking';
+    if (mic.hold) return 'pausing';
+    if (mic.running) return mic.interim ? 'hearing' : 'listening';
+    if (mic.starting) return 'starting';
+    if (mic.trPending) return 'translating';
+    return 'restarting';
+  }
+
+  function micStatus() {
+    const ph = micPhase();
+    const lang = micLangName(state.settings.micLang);
+    const fatalMsgs = {
+      'not-allowed': 'Permiso de micrófono denegado. Toca el candado 🔒 junto a la dirección › Permisos › Micrófono › Permitir, y vuelve a pulsar Empezar.',
+      'service-not-allowed': 'Este navegador no permite el reconocimiento de voz. Abre la app en Google Chrome (no en modo incógnito ni dentro de otra app).',
+      'language-not-supported': `Chrome no reconoce «${lang}» en este dispositivo. Elige otro idioma.`,
+    };
+    switch (ph) {
+      case 'unsupported': return { kind: 'err', title: 'Sin reconocimiento de voz', msg: 'Este navegador no puede escuchar por el micrófono. Usa Google Chrome actualizado en Android.' };
+      case 'fatal': return { kind: 'err', title: 'Micrófono detenido', msg: fatalMsgs[mic.fatal] || `Error: ${mic.fatal}` };
+      case 'idle': return { kind: 'idle', title: 'Listo', msg: 'Pulsa «Empezar», permite el micrófono y reproduce el vídeo en voz alta.' };
+      case 'tts-broken': return { kind: 'err', title: 'La voz no funciona', msg: tts.brokenMsg || 'La voz del móvil no responde. Prueba «Probar voz».' };
+      case 'tts-blocked': return { kind: 'err', title: 'Voz bloqueada', msg: 'Toca la pantalla para activar la voz en español.' };
+      case 'speaking': return { kind: 'ok', title: 'Hablando en español…', msg: 'Micrófono en pausa mientras habla (para no oírse a sí mismo).' };
+      case 'pausing': return { kind: 'busy', title: 'Preparando la voz…', msg: 'Cerrando el micrófono para hablar.' };
+      case 'hearing': return { kind: 'ok', title: 'Oyendo voz…', msg: `Reconociendo ${micLangWord(state.settings.micLang)}. La traducción llega al terminar cada frase.` };
+      case 'translating': return { kind: 'busy', title: 'Traduciendo…', msg: 'Pasando la frase al español.' };
+      case 'listening':
+      case 'starting':
+      case 'restarting': {
+        if (document.hidden) return { kind: 'warn', title: 'Chrome en segundo plano', msg: 'Puede dejar de escuchar. Usa pantalla dividida para que Chrome siga visible.' };
+        if (mic.error === 'network') return { kind: 'err', title: 'Sin conexión', msg: 'El reconocimiento de voz de Chrome necesita internet. Reintentando…' };
+        if (mic.error === 'audio-capture') return { kind: 'err', title: 'Micrófono ocupado', msg: 'No se puede usar el micrófono (¿lo está usando otra app?). Reintentando…' };
+        if (ph === 'starting') return { kind: 'busy', title: 'Activando el micrófono…', msg: 'Si Chrome lo pregunta, toca «Permitir».' };
+        if (ph === 'restarting') return { kind: 'busy', title: 'Escuchando…', msg: mic.error === 'no-speech' ? 'No se oye voz: sube el volumen del vídeo y acerca el móvil al altavoz.' : 'Reactivando el micrófono…' };
+        return { kind: 'ok', title: 'Escuchando…', msg: mic.error === 'no-speech' ? 'No se oye voz: sube el volumen del vídeo y acerca el móvil al altavoz.' : `Reproduce el vídeo en ${micLangWord(state.settings.micLang)} con el volumen alto.` };
+      }
+      default: return { kind: 'idle', title: '', msg: '' };
+    }
+  }
+
+  function micUpdateUI() {
+    if (state.view !== 'mic') return;
+    const ph = micPhase();
+    const btn = document.getElementById('mic-btn');
+    if (btn) {
+      const cls = `mic-btn${mic.active ? ' on' : ''}${['listening', 'hearing'].includes(ph) ? ' listening' : ''}${ph === 'speaking' ? ' speaking' : ''}${!mic.supported ? ' disabled' : ''}`;
+      if (btn.className !== cls) btn.className = cls;
+      const label = mic.active ? 'Parar' : 'Empezar';
+      const lab = btn.querySelector('.lbl');
+      if (lab && lab.textContent !== label) lab.textContent = label;
+      const ico = btn.querySelector('.ico');
+      const icon = mic.active ? (ph === 'speaking' ? '🔊' : '■') : '🎙️';
+      if (ico && ico.textContent !== icon) ico.textContent = icon;
+      btn.setAttribute('aria-pressed', String(mic.active));
+    }
+    const st = micStatus();
+    const box = document.getElementById('mic-status');
+    if (box) {
+      const html = `<i class="dot"></i><div><b>${escapeHtml(st.title)}</b><small>${escapeHtml(st.msg)}</small></div>`;
+      if (box.innerHTML !== html) box.innerHTML = html;
+      box.className = `mic-status ${st.kind}`;
+    }
+    const counts = document.getElementById('mic-counts');
+    if (counts) {
+      const t = mic.stats.finals ? `${mic.stats.finals} frases oídas · ${mic.stats.translated} traducidas · ${mic.stats.spoken} dichas${mic.stats.trFailed ? ` · ${mic.stats.trFailed} sin traducir` : ''}` : '';
+      if (counts.textContent !== t) counts.textContent = t;
+    }
+    micRenderLive();
+  }
+
+  function micRenderLive() {
+    const el = document.getElementById('mic-live');
+    if (!el) return;
+    el.classList.toggle('hidden', !state.settings.micShowText);
+    if (!state.settings.micShowText) return;
+    const lines = mic.lines.slice(-6).reverse().map((l) => `
+      <div class="mic-line"><div class="es">${l.es ? escapeHtml(l.es) : (l.failed ? '<span class="fail">No se pudo traducir</span>' : '<span class="pending">Traduciendo…</span>')}</div><div class="en">${escapeHtml(l.en)}</div></div>`).join('');
+    const html = `${mic.interim ? `<div class="interim">${escapeHtml(mic.interim)}…</div>` : ''}${lines || (mic.interim ? '' : '<div class="empty">Aquí aparecerá el texto reconocido y su traducción.</div>')}`;
+    if (el.innerHTML !== html) el.innerHTML = html;
+  }
+
+  function renderMic() {
+    const s = state.settings;
+    const opts = MIC_LANGS.map(([code, name]) => `<option value="${code}" ${code === s.micLang ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('');
+    return `
+    <div class="view" id="view-mic">
+      <div class="player-top">
+        <button class="icon-btn" id="btn-back" aria-label="Volver">←</button>
+        <h2>Modo micrófono</h2>
+        <button class="icon-btn" id="btn-settings" title="Ajustes" aria-label="Ajustes">⚙️</button>
+      </div>
+
+      <section class="mic-stage">
+        <p class="mic-kicker">Instagram · Facebook · cualquier vídeo que suene en voz alta</p>
+        <button type="button" class="mic-btn" id="mic-btn" aria-pressed="false" aria-label="Empezar o parar el modo micrófono">
+          <span class="ico">🎙️</span><span class="lbl">Empezar</span>
+        </button>
+        <div class="mic-status idle" id="mic-status" role="status" aria-live="polite"></div>
+        <p class="mic-counts" id="mic-counts"></p>
+      </section>
+
+      <div class="mic-live caption-box hidden" id="mic-live" aria-live="polite"></div>
+
+      <div class="card controls">
+        <h3>Ajustes rápidos</h3>
+        <div class="ctrl-row">
+          <label for="mic-lang">Idioma del vídeo</label>
+          <select id="mic-lang" class="select">${opts}</select>
+        </div>
+        <div class="ctrl-row">
+          <label for="rng-rate">Velocidad voz</label>
+          <input type="range" id="rng-rate" min="0.7" max="1.4" step="0.05" value="${s.voiceRate}">
+          <output id="out-rate">${Number(s.voiceRate).toFixed(2)}×</output>
+        </div>
+        <div class="toggle"><span>Mostrar texto en pantalla</span><button type="button" class="switch ${s.micShowText ? 'on' : ''}" data-key="micShowText" aria-pressed="${!!s.micShowText}" aria-label="Mostrar texto en pantalla"></button></div>
+        <button type="button" class="btn-ghost" id="btn-test-voice-inline" style="width:100%">🔊 Probar voz</button>
+      </div>
+
+      <section class="card help-card">
+        <h3>Cómo usarlo</h3>
+        <ol class="help-list">
+          <li>Abre Instagram o Facebook en <b>pantalla dividida</b>, en <b>ventana flotante</b> o en <b>otro dispositivo</b>.</li>
+          <li>Reproduce el vídeo con el <b>volumen alto</b> y <b>sin auriculares</b>.</li>
+          <li>Pulsa <b>Empezar</b> aquí y <b>permite el micrófono</b>.</li>
+          <li>Cuenta con <b>3–5 s de retraso</b>; la <b>música de fondo</b> empeora el reconocimiento.</li>
+        </ol>
+        <div class="tip"><b>Truco Android:</b> usa la pantalla dividida (botón de apps recientes › toca el icono de la app › <b>«Pantalla dividida»</b>) para tener Chrome y el vídeo a la vez. O reproduce el vídeo en una tablet/PC y escucha con el móvil.</div>
+        <details class="limits">
+          <summary>Limitaciones</summary>
+          <ul>
+            <li>Mientras habla la voz española el micrófono se pausa: lo que se diga en el vídeo en ese momento se pierde.</li>
+            <li>En algunos Android, al activarse el micrófono la otra app <b>pausa o baja</b> su vídeo (Android le da el audio a Chrome). Si pasa, vuelve a darle a play o usa otro dispositivo para el vídeo: es lo más fiable.</li>
+            <li>Si Chrome pasa a segundo plano o se apaga la pantalla, deja de escuchar. Con la pantalla dividida Chrome sigue visible.</li>
+            <li>El reconocimiento de Chrome necesita internet. En Android puede sonar un pitido cada vez que el micrófono se reactiva.</li>
+            <li>Funciona mejor con una sola persona hablando claro; canciones, ruido o varias voces a la vez fallan más.</li>
+          </ul>
+        </details>
+      </section>
+      <p class="footer-note">El audio se procesa con el reconocimiento de voz de Chrome (Google) · v${APP_VERSION}</p>
+    </div>`;
+  }
+
+  function openMic() {
+    state.loadToken += 1;
+    ttsStop();
+    destroyPlayer();
+    state.videoId = null;
+    state.segments = [];
+    state.load = { phase: 'idle', msg: '', done: 0 };
+    state.view = 'mic';
+    render();
+  }
+
   // ---------- YouTube player ----------
   window.onYouTubeIframeAPIReady = () => {
     state.ytReady = true;
@@ -890,7 +1432,9 @@
   // ---------- UI ----------
   function render() {
     const app = document.getElementById('app');
+    if (state.view !== 'mic' && mic.active) micStop(); // salir del modo micrófono apaga el micro
     if (state.view === 'home') app.innerHTML = renderHome();
+    else if (state.view === 'mic') app.innerHTML = renderMic();
     else app.innerHTML = renderPlayer();
     bindView();
   }
@@ -920,6 +1464,12 @@
           <button class="btn-primary" id="btn-load">Abrir</button>
         </div>
       </section>
+
+      <button type="button" class="mic-entry" id="btn-mic">
+        <span class="mic-entry-icon">🎙️</span>
+        <div class="meta"><b>Modo micrófono <span class="badge-new">Nuevo</span></b><small>Para Instagram, Facebook… Pon el vídeo en voz alta y lo oyes en español.</small></div>
+        <span class="chev" aria-hidden="true">›</span>
+      </button>
 
       <section class="card">
         <h3>Cómo funciona</h3>
@@ -1005,6 +1555,7 @@
   }
 
   function goHome() {
+    micStop();
     state.loadToken += 1;
     ttsStop();
     destroyPlayer();
@@ -1033,6 +1584,7 @@
   function bindView() {
     document.getElementById('btn-settings')?.addEventListener('click', openSettings);
     document.getElementById('btn-back')?.addEventListener('click', goHome);
+    document.getElementById('btn-mic')?.addEventListener('click', () => openMic());
     document.getElementById('btn-load')?.addEventListener('click', () => {
       openVideo(document.getElementById('url-input')?.value || '');
       ttsUnlock('Preparando el doblaje');
@@ -1067,6 +1619,7 @@
         saveJSON(STORAGE.settings, state.settings);
         if (key === 'showCaptions') document.getElementById('caption-box')?.classList.toggle('hidden', !state.settings.showCaptions);
         if (key === 'muteOriginal') applyAudio();
+        if (key === 'micShowText') micUpdateUI();
       });
     });
 
@@ -1083,6 +1636,27 @@
     document.getElementById('btn-seek-fwd')?.addEventListener('click', () => seekBy(10));
     document.getElementById('btn-paste')?.addEventListener('click', openPasteSheet);
     document.getElementById('btn-test-voice-inline')?.addEventListener('click', () => testVoice());
+
+    if (state.view === 'mic') {
+      document.getElementById('mic-btn')?.addEventListener('click', () => {
+        if (mic.active) micStopTap(); else micStartTap();
+      });
+      const sel = document.getElementById('mic-lang');
+      sel?.addEventListener('change', () => {
+        state.settings.micLang = sel.value;
+        saveJSON(STORAGE.settings, state.settings);
+        if (mic.rec) { // reiniciar el reconocimiento con el idioma nuevo
+          const rec = mic.rec;
+          micDetach();
+          try { rec.abort(); } catch { /* */ }
+          mic.backoff = 0; mic.nextStartAt = performance.now() + 250; mic.endedAt = performance.now();
+        }
+        toast(`Idioma del vídeo: ${micLangName(sel.value)}`);
+        micUpdateUI();
+      });
+      ttsLoadVoices();
+      micUpdateUI();
+    }
 
     if (state.view === 'player') {
       if (state.ytReady && !state.player) mountPlayer();
@@ -1343,8 +1917,14 @@
     }
     // cualquier toque en la página reactiva la voz si el navegador la bloqueó por falta de gesto
     document.addEventListener('click', () => {
-      if (tts.lastError === 'not-allowed') ttsUnlock('Doblaje activado');
+      if (tts.lastError === 'not-allowed') ttsUnlock(state.view === 'mic' ? 'Voz activada' : 'Doblaje activado');
     }, true);
+    // Modo micrófono: reflejar segundo plano y recuperar el bloqueo de pantalla al volver
+    document.addEventListener('visibilitychange', () => {
+      if (!mic.active) return;
+      if (!document.hidden) { micWakeLock(true); mic.nextStartAt = Math.min(mic.nextStartAt, performance.now()); }
+      micUpdateUI();
+    });
     const params = new URLSearchParams(location.search);
     if (params.get('demo') === '1') state.demoMode = true;
     window.__ytCast = {
@@ -1364,7 +1944,12 @@
       ttsUnlock,
       testVoice,
       hasSpanishVoice,
+      mic,
+      micStartTap,
+      micStopTap,
+      openMic,
     };
+    if (params.get('micro') === '1' || location.hash === '#micro') state.view = 'mic';
     render();
     if (params.get('v')) openVideo(params.get('v'));
   }

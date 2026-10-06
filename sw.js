@@ -1,6 +1,6 @@
 /* Service worker — red primero para la app (así las actualizaciones llegan al recargar),
    caché como respaldo sin conexión. */
-const CACHE_VERSION = 'yt-castellano-v4';
+const CACHE_VERSION = 'yt-castellano-v5';
 const ASSETS = [
   './', './index.html', './styles.css', './app.js', './manifest.json',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png'
