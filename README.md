@@ -11,8 +11,6 @@ Doblaje aproximado en español de vídeos de YouTube: pegas el enlace y **oyes u
 - Ejemplo: `?v=iG9CE55wbtY` (TED — Sir Ken Robinson)
 - Local: `python3 -m http.server 8080` en esta carpeta
 
-> Nota: el sitio Pages queda en cola de GitHub Actions (`pages-build-deployment` / `Deploy Pages`) hasta que un runner lo publique; el código ya está en `main` y `gh-pages`.
-
 ## Qué funciona (oct 2026)
 
 | Pieza | Origen elegido |
@@ -21,8 +19,17 @@ Doblaje aproximado en español de vídeos de YouTube: pegas el enlace y **oyes u
 | Reserva | Cloudflare Worker opcional (`worker/caption-proxy.js`) vía Innertube ANDROID. |
 | Sin subtítulos | Pegar transcripción manual (SRT / `[mm:ss] texto`). |
 | Traducción extra | Si solo hay EN: `clients5.google.com/translate_a/t` (CORS `*`), luego MyMemory. Caché en `localStorage`. |
-| Voz | `speechSynthesis` con voz `es-ES` si el sistema la tiene. |
+| Voz | `speechSynthesis` `lang=es-ES` (en Android sin fijar `utterance.voice`; en escritorio voz es-ES concreta con reintento sin ella). Se desbloquea con el toque en «▶ Reproducir con voz». |
 | Vídeo | YouTube IFrame Player API + `setVolume` para ducking/mute. |
+
+## Robustez de la voz (v4)
+
+- La voz se **desbloquea con un gesto** (Abrir / «▶ Reproducir con voz» / cualquier toque si el navegador devolvió `not-allowed`).
+- Cola de doblaje con puntero monótono: cada frase se encola **una vez** al pasar su inicio; reinicio solo en seek. Nunca `cancel()+speak()` en el mismo tick; frases ≤ 200 caracteres; keepalive `resume()`; temporizadores de seguridad si no llega `onstart`/`onend`.
+- Si la pista pedida (`es`) no existe, la API devuelve otra (p. ej. inglés automático): se detecta por `track.language` y se **traduce** (clients5 por lotes → gtx → MyMemory).
+- El audio original **solo se silencia** cuando hay frases en español listas y la voz funciona; si no, suena el original y la línea de estado explica el motivo.
+- Ajustes › **Probar voz** dice una frase de prueba y muestra la voz detectada.
+- Tests: `tools/e2e-dub.js <url> <videoId>` y `tools/e2e-dub-edge.js <url>` (Chromium headless, tamaño móvil, motor TTS simulado tipo Android).
 
 ## Limitaciones
 

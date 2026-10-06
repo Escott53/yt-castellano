@@ -1,17 +1,24 @@
-/* Service worker — cache-first de la app estática. */
-const CACHE_VERSION = 'yt-castellano-v3';
+/* Service worker — red primero para la app (así las actualizaciones llegan al recargar),
+   caché como respaldo sin conexión. */
+const CACHE_VERSION = 'yt-castellano-v4';
 const ASSETS = [
   './', './index.html', './styles.css', './app.js', './manifest.json',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png'
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE_VERSION).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  e.waitUntil(
+    caches.open(CACHE_VERSION)
+      .then((c) => c.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' }))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener('activate', (e) => {
   e.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE_VERSION).map((k) => caches.delete(k))))
+    caches.keys().then((keys) => Promise.all(keys
+      .filter((k) => k !== CACHE_VERSION && k !== CACHE_VERSION + '-thumbs')
+      .map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -37,19 +44,16 @@ self.addEventListener('fetch', (e) => {
     return;
   }
   if (url.origin !== self.location.origin) return;
-  if (req.mode === 'navigate') {
-    e.respondWith(fetch(req).then((res) => {
-      const copy = res.clone();
-      caches.open(CACHE_VERSION).then((c) => c.put('./index.html', copy));
+  // red primero (sin caché HTTP), caché si no hay conexión
+  e.respondWith(
+    fetch(req, { cache: 'no-cache' }).then((res) => {
+      if (res.ok) {
+        const copy = res.clone();
+        const key = req.mode === 'navigate' ? './index.html' : req;
+        caches.open(CACHE_VERSION).then((c) => c.put(key, copy));
+      }
       return res;
-    }).catch(() => caches.match('./index.html')));
-    return;
-  }
-  e.respondWith(caches.match(req).then((hit) => hit || fetch(req).then((res) => {
-    if (res.ok) {
-      const copy = res.clone();
-      caches.open(CACHE_VERSION).then((c) => c.put(req, copy));
-    }
-    return res;
-  })));
+    }).catch(async () => (await caches.match(req, { ignoreSearch: req.mode === 'navigate' }))
+      || (req.mode === 'navigate' ? caches.match('./index.html') : Response.error()))
+  );
 });
